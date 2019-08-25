@@ -1,0 +1,24 @@
+name: app
+version: 0.1.0.0
+dependencies:
+  - base
+default-extensions:
+  - OverloadedStrings
+  - LambdaCase
+  - MultiWayIf
+  - TemplateHaskell
+  - FlexibleContexts
+  - FlexibleInstances
+  - MultiParamTypeClasses
+  - NoMonomorphismRestriction
+  - BangPatterns
+  - ScopedTypeVariables
+  - TupleSections
+  - DeriveFunctor
+  - DeriveTraversable
+  - DeriveFoldable
+  - DeriveGeneric
+executables:
+  app:
+    source-dirs: src
+    main: Main.hs
