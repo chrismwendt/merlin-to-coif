@@ -2,6 +2,14 @@ name: app
 version: 0.1.0.0
 dependencies:
   - base
+  - megaparsec
+  - containers
+  - sqlite-simple
+  - directory
+  - Glob
+  - text
+  - clock
+  - formatting
 default-extensions:
   - OverloadedStrings
   - LambdaCase
