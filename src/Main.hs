@@ -1,5 +1,6 @@
 module Main where
 
+import           Text.RawString.QQ
 import           Text.Megaparsec.Char
 import           Data.Void
 import qualified Data.Set                      as Set
@@ -27,6 +28,7 @@ import           Formatting                     ( fprint
                                                 , string
                                                 )
 import           Formatting.Clock               ( timeSpecs )
+import           Control.Error.Util             ( (?:) )
 import           Text.Megaparsec
 
 main :: IO ()
@@ -38,16 +40,25 @@ ghci = void $ do
   withConnection "scratch.db" $ \conn -> do
     execute_ conn "PRAGMA foreign_keys = ON"
 
-    execute_ conn "CREATE TABLE symbols (qualname TEXT NOT NULL, defloc TEXT NOT NULL, PRIMARY KEY (qualname, defloc), CHECK (qualname != '' OR defloc != ''))"
-    execute_ conn "CREATE TABLE symrefs (qualname TEXT NOT NULL, defloc TEXT NOT NULL, loc TEXT NOT NULL PRIMARY KEY)"
+    execute_ conn "CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT NOT NULL, defloc TEXT NOT NULL, UNIQUE (name, defloc), CHECK (name != '' OR defloc != ''))"
+    execute_ conn "CREATE INDEX symbols_defloc on symbols(defloc)"
+    execute_ conn "CREATE TABLE refs (name TEXT NOT NULL, defloc TEXT NOT NULL, refloc TEXT NOT NULL PRIMARY KEY, CHECK (name != '' OR defloc != ''))"
 
-    execute_ conn "CREATE TABLE defs (loc TEXT NOT NULL PRIMARY KEY, qualname TEXT NOT NULL, toplevel INTEGER NOT NULL CHECK (toplevel IN (0, 1)))"
-    execute_ conn "CREATE TABLE ref  (loc TEXT NOT NULL PRIMARY KEY, qualname TEXT NOT NULL, defloc TEXT NOT NULL)"
-    execute_ conn "CREATE TABLE decldef (loc TEXT NOT NULL PRIMARY KEY, defloc TEXT NOT NULL)"
+    -- {"symbol":{"name":"printf"}}
+    -- {"ref":"main.cpp:3:4-3:8"}
+    -- {"ref":"main.cpp:4:4-4:8"}
+    -- {"symbol":{"def":"lib.cpp:2:3"}}
+    -- {"ref":"main.cpp:1:1-1:2"}
+    -- {"symbol":{"name":"uppercase","def":"lib.cpp:2:3"}}
+    -- {"ref":"main.cpp:5:1-5:8"}
 
-    -- files <- glob "/Users/chrismwendt/github.com/sourcegraph/lsif-cpp/examples/cross-app/output/*.csv"
-    -- files <- glob "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/*.csv"
-    files <- glob "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/8e953de7fce99ed9cd0fe37c8ecd2735133e295b.81fea659b0e5b85f76560c945532bc802e10e90c.csv"
+    -- TODO try eliminating this by modifying dxr-indexer.cpp
+    execute_ conn "CREATE TABLE decldef (refloc TEXT NOT NULL PRIMARY KEY, defloc TEXT NOT NULL)"
+
+    -- files <- glob "/Users/chrismwendt/github.com/sourcegraph/lsif-cpp/examples/five/output/*.csv"
+    -- files <- glob "/Users/chrismwendt/github.com/sourcegraph/lsif-cpp/examples/cross-lib/output/*.csv"
+    files <- glob "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/*.csv"
+    -- files <- glob "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/e982a0fadaffe985944b3968e19f4ee997e89389.62ef97ce5fa67ae873e77b9f161c699c392fd296.csv"
     forM
       files
       (\file -> do
@@ -60,41 +71,66 @@ ghci = void $ do
             fprint ("Parsing " % timeSpecs % " " % Formatting.string % "\n") start end file
             start <- getTime Monotonic
             withTransaction conn $ forM_ rows $ \r@(Row kind kvs) -> do
+              let name = if kind == "variable" && "scopequalname" `Map.member` kvs then "" else fromJust $ msum $ map (kvs !?) ["qualname", "name"]
+                  def  = execute conn "INSERT INTO symbols (name, defloc) VALUES (?, ?) ON CONFLICT DO NOTHING" (name, kvs ! "loc")
               case kind of
-                "type"     -> execute conn "INSERT INTO defs (loc, qualname, toplevel) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", kvs ! "qualname", 1 :: Int)
-                "typedef"  -> execute conn "INSERT INTO defs (loc, qualname, toplevel) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", kvs ! "qualname", 1 :: Int)
-                "decldef"  -> when ("defloc" `Map.member` kvs) $ execute conn "INSERT INTO decldef (loc, defloc) VALUES (?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", kvs ! "defloc")
-                "function" -> execute conn "INSERT INTO defs (loc, qualname, toplevel) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", kvs ! "qualname", 1 :: Int)
-                "macro"    -> execute conn "INSERT INTO defs (loc, qualname, toplevel) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", kvs ! "name", 1 :: Int)
-                "variable" -> execute conn "INSERT INTO defs (loc, qualname, toplevel) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", kvs ! "qualname", sqliteBool (not $ "scopequalname" `Map.member` kvs))
-                "ref" ->
-                  let qualname = fromJust $ msum $ map (kvs !?) ["qualname", "name"]
-                  in  case kvs !? "defloc" of
-                        Nothing -> do
-                          execute conn "INSERT INTO symbols (qualname, defloc) VALUES (?, '') ON CONFLICT DO NOTHING"         (Only qualname)
-                          execute conn "INSERT INTO symrefs (qualname, defloc, loc) VALUES (?, '', ?) ON CONFLICT DO NOTHING" (Just qualname, kvs ! "loc")
-                        Just defloc -> execute conn "INSERT INTO ref (loc, qualname, defloc) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", qualname, defloc)
-                "include" -> return ()
-                "warning" -> return ()
-                "call"    -> return ()
-                _         -> putStrLn $ "UNIMPLEMENTED " ++ show r
+                "type"     -> def
+                "typedef"  -> def
+                "function" -> def
+                "macro"    -> def
+                "variable" -> def
+                "decldef"  -> when ("defloc" `Map.member` kvs) $ execute conn "INSERT INTO decldef (refloc, defloc) VALUES (?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", kvs ! "defloc")
+                "ref"      -> execute conn "INSERT INTO refs (name, defloc, refloc) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (name, (kvs !? "defloc") ?: "", kvs ! "loc")
+                "include"  -> return ()
+                "warning"  -> return ()
+                "call"     -> return ()
+                _          -> putStrLn $ "UNIMPLEMENTED " ++ show r
             end <- getTime Monotonic
             fprint ("Inserting " % timeSpecs % " " % Formatting.string % "\n") start end file
       )
 
-    start <- getTime Monotonic
-    execute_ conn "UPDATE ref SET defloc = (SELECT d.defloc FROM decldef d WHERE d.loc = ref.defloc) WHERE defloc IN (SELECT d.loc FROM decldef d WHERE d.loc = ref.defloc)"
-    execute_ conn "DROP TABLE decldef"
+    texecute_ conn $ Query $ T.pack $ unwords ["UPDATE refs SET defloc = (SELECT d.defloc FROM decldef d WHERE d.refloc = refs.defloc)", "         WHERE defloc IN (SELECT refloc FROM decldef)"]
+    texecute_ conn "DROP TABLE decldef"
 
-    execute_ conn "INSERT INTO symbols (qualname, defloc) SELECT CASE WHEN defs.toplevel = 1 THEN defs.qualname ELSE '' END, defs.loc FROM defs JOIN ref ON defs.loc = ref.defloc ON conflict DO NOTHING"
-    execute_ conn "INSERT INTO symrefs (qualname, defloc, loc) SELECT CASE WHEN defs.toplevel = 1 THEN defs.qualname ELSE '' END, defs.loc, ref.loc FROM defs JOIN ref ON defs.loc = ref.defloc ON conflict DO NOTHING"
-    execute_ conn "INSERT INTO symbols (qualname, defloc) SELECT ref.qualname, '' FROM ref LEFT JOIN defs ON defs.loc = ref.defloc WHERE defs.loc IS NULL ON conflict DO NOTHING"
-    execute_ conn "INSERT INTO symrefs (qualname, defloc, loc) SELECT ref.qualname, '', ref.loc FROM ref LEFT JOIN defs ON defs.loc = ref.defloc WHERE defs.loc IS NULL ON conflict DO NOTHING"
+    texecute_ conn "UPDATE refs SET name = (SELECT name FROM symbols WHERE refs.defloc = symbols.defloc AND refs.defloc != '') WHERE EXISTS (SELECT * FROM symbols WHERE refs.defloc = symbols.defloc AND refs.defloc != '')"
 
-    execute_ conn "DROP TABLE defs"
-    execute_ conn "DROP TABLE ref"
-    end <- getTime Monotonic
-    fprint ("Finalize " % timeSpecs % "\n") start end
+    texecute_ conn "UPDATE refs SET defloc = '' WHERE NOT EXISTS (SELECT * FROM symbols WHERE refs.defloc = symbols.defloc)"
+
+    texecute_ conn $ Query $ T.pack $ [r|
+      INSERT INTO symbols (name, defloc)
+                    SELECT refs.name, '' FROM refs
+                    WHERE refs.defloc = ''
+                    ON CONFLICT DO NOTHING
+    |]
+
+    texecute_ conn "CREATE TABLE refs_tmp AS SELECT * FROM refs"
+    texecute_ conn "DROP TABLE refs"
+    texecute_ conn "CREATE TABLE refs (refloc TEXT NOT NULL PRIMARY KEY, sid INTEGER NOT NULL, FOREIGN KEY (sid) REFERENCES symbols(id))"
+    texecute_ conn $ Query $ T.pack $ [r|
+      INSERT INTO refs (refloc, sid)
+      SELECT refloc, id FROM refs_tmp
+      JOIN symbols on
+      refs_tmp.name = symbols.name AND
+      refs_tmp.defloc = symbols.defloc
+    |]
+    texecute_ conn "DROP TABLE refs_tmp"
+
+texecute_ :: Connection -> Query -> IO ()
+texecute_ conn q = timeIt (show q) $ execute_ conn q
+
+timeIt :: String -> IO a -> IO a
+timeIt label a = do
+  start <- getTime Monotonic
+  r     <- a
+  end   <- getTime Monotonic
+  fprint (timeSpecs % ": " % Formatting.string % "\n") start end label
+  return r
+
+showTable :: Connection -> String -> IO ()
+showTable conn table = do
+  putStrLn $ "--- " ++ table
+  results <- query_ conn (Query $ T.pack $ "SELECT * FROM " ++ table) :: IO [[SQLData]]
+  mapM_ print results
 
 sqliteBool :: Bool -> Int
 sqliteBool False = 0

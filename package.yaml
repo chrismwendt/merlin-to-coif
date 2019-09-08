@@ -10,8 +10,11 @@ dependencies:
   - text
   - clock
   - formatting
+  - errors
+  - raw-strings-qq
 default-extensions:
   - OverloadedStrings
+  - QuasiQuotes
   - LambdaCase
   - MultiWayIf
   - TemplateHaskell
