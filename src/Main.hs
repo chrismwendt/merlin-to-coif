@@ -82,6 +82,7 @@ ghci = void $ do
             fprint ("Inserting " % timeSpecs % " " % Formatting.string % "\n") start end file
       )
 
+    start <- getTime Monotonic
     execute_ conn "UPDATE ref SET defloc = (SELECT d.defloc FROM decldef d WHERE d.loc = ref.defloc) WHERE defloc IN (SELECT d.loc FROM decldef d WHERE d.loc = ref.defloc)"
     execute_ conn "DROP TABLE decldef"
 
@@ -92,6 +93,8 @@ ghci = void $ do
 
     execute_ conn "DROP TABLE defs"
     execute_ conn "DROP TABLE ref"
+    end <- getTime Monotonic
+    fprint ("Finalize " % timeSpecs % "\n") start end
 
 sqliteBool :: Bool -> Int
 sqliteBool False = 0
