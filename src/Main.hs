@@ -65,7 +65,7 @@ run (Args { csvFileGlob, out }) = do
 
     execute_ conn "CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT NOT NULL, defloc TEXT NOT NULL, deflocend TEXT NOT NULL, UNIQUE (name, defloc), CHECK (name != '' OR defloc != ''), CHECK ((defloc = '') = (deflocend = '')))"
     execute_ conn "CREATE INDEX symbols_defloc on symbols(defloc)"
-    execute_ conn "CREATE TABLE refs (name TEXT NOT NULL, defloc TEXT NOT NULL, refloc TEXT NOT NULL PRIMARY KEY, CHECK (name != '' OR defloc != ''))"
+    execute_ conn "CREATE TABLE refs (name TEXT NOT NULL, defloc TEXT NOT NULL, refloc TEXT NOT NULL PRIMARY KEY, reflocend TEXT NOT NULL, CHECK (name != '' OR defloc != ''))"
 
     -- {"symbol":{"name":"printf"}}
     -- {"ref":"main.cpp:3:4-3:8"}
@@ -106,7 +106,7 @@ run (Args { csvFileGlob, out }) = do
                 "macro"    -> def
                 "variable" -> def
                 "decldef"  -> when ("defloc" `Map.member` kvs) $ execute conn "INSERT INTO decldef (refloc, defloc) VALUES (?, ?) ON CONFLICT DO NOTHING" (kvs ! "loc", kvs ! "defloc")
-                "ref"      -> execute conn "INSERT INTO refs (name, defloc, refloc) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (name, (kvs !? "defloc") ?: "", kvs ! "loc")
+                "ref"      -> execute conn "INSERT INTO refs (name, defloc, refloc, reflocend) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING" (name, (kvs !? "defloc") ?: "", kvs ! "loc", kvs ! "locend")
                 "include"  -> return ()
                 "warning"  -> return ()
                 "call"     -> return ()
@@ -129,10 +129,10 @@ run (Args { csvFileGlob, out }) = do
 
     texecute_ conn "CREATE TABLE refs_tmp AS SELECT * FROM refs"
     texecute_ conn "DROP TABLE refs"
-    texecute_ conn "CREATE TABLE refs (refloc TEXT NOT NULL PRIMARY KEY, sid INTEGER NOT NULL, FOREIGN KEY (sid) REFERENCES symbols(id))"
+    texecute_ conn "CREATE TABLE refs (refloc TEXT NOT NULL PRIMARY KEY, reflocend TEXT NOT NULL, sid INTEGER NOT NULL, FOREIGN KEY (sid) REFERENCES symbols(id))"
     texecute_ conn $ Query $ T.pack $ [r|
-      INSERT INTO refs (refloc, sid)
-      SELECT refloc, id FROM refs_tmp
+      INSERT INTO refs (refloc, reflocend, sid)
+      SELECT refloc, reflocend, id FROM refs_tmp
       JOIN symbols on
       refs_tmp.name = symbols.name AND
       refs_tmp.defloc = symbols.defloc
