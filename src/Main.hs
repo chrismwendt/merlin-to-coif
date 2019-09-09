@@ -1,7 +1,15 @@
 module Main where
 
 import           Text.RawString.QQ
-import           Text.Megaparsec.Char
+import           Control.Applicative
+import qualified Data.ByteString               as BS
+import qualified Data.ByteString.Lazy          as BSL
+import qualified Data.ByteString.Char8         as BSC
+import qualified Data.ByteString.Lazy.Char8    as BSLC
+import qualified Data.Attoparsec.ByteString.Char8
+                                               as A
+import qualified Text.Megaparsec               as M
+import qualified Text.Megaparsec.Char          as M
 import           Data.Void
 import qualified Data.Set                      as Set
 import           Data.Set                       ( Set )
@@ -28,19 +36,34 @@ import           Formatting                     ( fprint
                                                 , string
                                                 )
 import           Formatting.Clock               ( timeSpecs )
+import           Data.Typeable
+import           Data.Data
+import           System.Exit
+import           System.Environment
 import           Control.Error.Util             ( (?:) )
-import           Text.Megaparsec
 
 main :: IO ()
-main = putStr "hello, world\n"
+main = do
+  csvFileGlob <- getEnv "csvFileGlob"
+  out         <- getEnv "out"
+  run (Args { csvFileGlob, out })
+
+data Args = Args {csvFileGlob :: String, out :: String} deriving (Show)
 
 ghci :: IO ()
 ghci = void $ do
+  run (Args { csvFileGlob = "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/e982a0fadaffe985944b3968e19f4ee997e89389.62ef97ce5fa67ae873e77b9f161c699c392fd296.csv", out = "out.jsonl" })
+
+run :: Args -> IO ()
+run (Args { csvFileGlob, out }) = do
+  when (csvFileGlob == "") $ putStrLn "Must specify --csvFileGlob" >> exitFailure
+  when (out == "") $ putStrLn "Must specify --out" >> exitFailure
+
   removeIfExists "scratch.db"
   withConnection "scratch.db" $ \conn -> do
     execute_ conn "PRAGMA foreign_keys = ON"
 
-    execute_ conn "CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT NOT NULL, defloc TEXT NOT NULL, UNIQUE (name, defloc), CHECK (name != '' OR defloc != ''))"
+    execute_ conn "CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT NOT NULL, defloc TEXT NOT NULL, deflocend TEXT NOT NULL, UNIQUE (name, defloc), CHECK (name != '' OR defloc != ''), CHECK ((defloc = '') = (deflocend = '')))"
     execute_ conn "CREATE INDEX symbols_defloc on symbols(defloc)"
     execute_ conn "CREATE TABLE refs (name TEXT NOT NULL, defloc TEXT NOT NULL, refloc TEXT NOT NULL PRIMARY KEY, CHECK (name != '' OR defloc != ''))"
 
@@ -57,22 +80,25 @@ ghci = void $ do
 
     -- files <- glob "/Users/chrismwendt/github.com/sourcegraph/lsif-cpp/examples/five/output/*.csv"
     -- files <- glob "/Users/chrismwendt/github.com/sourcegraph/lsif-cpp/examples/cross-lib/output/*.csv"
-    files <- glob "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/*.csv"
-    -- files <- glob "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/e982a0fadaffe985944b3968e19f4ee997e89389.62ef97ce5fa67ae873e77b9f161c699c392fd296.csv"
+    -- files <- glob "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/*.csv"
+    files <- glob csvFileGlob
     forM
       files
       (\file -> do
-        input <- readFile file
-        start <- getTime Monotonic
-        case runParser fileP "blah" input of
-          Left  err  -> putStrLn $ errorBundlePretty err
+        -- input  <- readFile file
+        -- result <- timeIt ("parse " ++ file) $ case M.runParser filePM "blah" input of
+        --   Left  err  -> return (Left (M.errorBundlePretty err))
+        --   Right rows -> return (Right rows)
+        input  <- BS.readFile file
+        result <- timeIt ("parse " ++ file) $ case A.parseOnly filePA input of
+          Left  err  -> return (Left err)
+          Right rows -> return (Right rows)
+        case result of
+          Left  err  -> putStrLn err
           Right rows -> do
-            end <- getTime Monotonic
-            fprint ("Parsing " % timeSpecs % " " % Formatting.string % "\n") start end file
-            start <- getTime Monotonic
-            withTransaction conn $ forM_ rows $ \r@(Row kind kvs) -> do
+            timeIt ("insert " ++ file) $ withTransaction conn $ forM_ rows $ \r@(Row kind kvs) -> do
               let name = if kind == "variable" && "scopequalname" `Map.member` kvs then "" else fromJust $ msum $ map (kvs !?) ["qualname", "name"]
-                  def  = execute conn "INSERT INTO symbols (name, defloc) VALUES (?, ?) ON CONFLICT DO NOTHING" (name, kvs ! "loc")
+                  def  = execute conn "INSERT INTO symbols (name, defloc, deflocend) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (name, kvs ! "loc", kvs ! "locend")
               case kind of
                 "type"     -> def
                 "typedef"  -> def
@@ -85,8 +111,6 @@ ghci = void $ do
                 "warning"  -> return ()
                 "call"     -> return ()
                 _          -> putStrLn $ "UNIMPLEMENTED " ++ show r
-            end <- getTime Monotonic
-            fprint ("Inserting " % timeSpecs % " " % Formatting.string % "\n") start end file
       )
 
     texecute_ conn $ Query $ T.pack $ unwords ["UPDATE refs SET defloc = (SELECT d.defloc FROM decldef d WHERE d.refloc = refs.defloc)", "         WHERE defloc IN (SELECT refloc FROM decldef)"]
@@ -97,8 +121,8 @@ ghci = void $ do
     texecute_ conn "UPDATE refs SET defloc = '' WHERE NOT EXISTS (SELECT * FROM symbols WHERE refs.defloc = symbols.defloc)"
 
     texecute_ conn $ Query $ T.pack $ [r|
-      INSERT INTO symbols (name, defloc)
-                    SELECT refs.name, '' FROM refs
+      INSERT INTO symbols (name, defloc, deflocend)
+                    SELECT refs.name, '', '' FROM refs
                     WHERE refs.defloc = ''
                     ON CONFLICT DO NOTHING
     |]
@@ -136,27 +160,44 @@ sqliteBool :: Bool -> Int
 sqliteBool False = 0
 sqliteBool True  = 1
 
-type Parser a = Parsec Void String a
+type MParser a = M.Parsec Void String a
+type AParser a = A.Parser a
 
-data Row = Row String (Map String String) deriving (Eq, Ord)
+data Row = Row BS.ByteString (Map BS.ByteString BS.ByteString) deriving (Eq, Ord)
 
 instance Show Row where
-  show (Row kind kvs) = "(" ++ kind ++ ") " ++ unwords (map (\(k, v) -> k ++ ":" ++ v) (Map.toList kvs))
+  show (Row kind kvs) = "(" ++ BSC.unpack kind ++ ") " ++ unwords (map (\(k, v) -> BSC.unpack k ++ ":" ++ BSC.unpack v) (Map.toList kvs))
 
-fileP :: Parser [Row]
-fileP = rowP `sepEndBy` "\n"
+filePM :: MParser [Row]
+filePM = rowPM `M.sepEndBy` "\n"
 
-rowP :: Parser Row
-rowP = do
-  let keyP :: Parser String
-      keyP = some (satisfy (\c -> ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || c == '_'))
-      quotedP :: Parser String
-      quotedP = char '"' *> many (try ('"' <$ "\"\"") <|> try (char '\\' *> anySingle) <|> anySingleBut '"') <* char '"'
-      kvP :: Parser (String, String)
-      kvP = (,) <$> keyP <* char ',' <*> quotedP
+rowPM :: MParser Row
+rowPM = do
+  let keyP :: MParser String
+      keyP = M.some (M.satisfy (\c -> ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || c == '_'))
+      quotedP :: MParser String
+      quotedP = M.char '"' *> M.many (M.try ('"' <$ "\"\"") <|> M.try (M.char '\\' *> M.anySingle) <|> M.anySingleBut '"') <* M.char '"'
+      kvP :: MParser (String, String)
+      kvP = (,) <$> keyP <* M.char ',' <*> quotedP
   kind <- keyP
-  char ','
-  keyvals <- kvP `sepBy` char ','
+  M.char ','
+  keyvals <- kvP `M.sepBy` M.char ','
+  return $ Row (BSC.pack kind) (Map.fromList $ map (\(k, v) -> (BSC.pack k, BSC.pack v)) keyvals)
+
+filePA :: AParser [Row]
+filePA = rowPA `M.sepEndBy` "\n"
+
+rowPA :: AParser Row
+rowPA = do
+  let keyP :: AParser BS.ByteString
+      keyP = A.takeWhile (\c -> ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || c == '_')
+      quotedP :: AParser BS.ByteString
+      quotedP = BSC.pack <$> (A.char '"' *> A.many' (('"' <$ "\"\"") <|> (A.char '\\' *> A.anyChar) <|> A.notChar '"') <* A.char '"')
+      kvP :: AParser (BS.ByteString, BS.ByteString)
+      kvP = (,) <$> keyP <* A.char ',' <*> quotedP
+  kind <- keyP
+  A.char ','
+  keyvals <- kvP `M.sepBy` A.char ','
   return $ Row kind (Map.fromList keyvals)
 
 removeIfExists :: FilePath -> IO ()

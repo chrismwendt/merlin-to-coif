@@ -12,6 +12,8 @@ dependencies:
   - formatting
   - errors
   - raw-strings-qq
+  - attoparsec
+  - bytestring
 default-extensions:
   - OverloadedStrings
   - QuasiQuotes
@@ -29,7 +31,9 @@ default-extensions:
   - DeriveTraversable
   - DeriveFoldable
   - DeriveGeneric
+  - NamedFieldPuns
 executables:
   app:
     source-dirs: src
     main: Main.hs
+    ghc-options: '-O2'
