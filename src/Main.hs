@@ -55,20 +55,25 @@ main :: IO ()
 main = do
   csvFileGlob <- getEnv "csvFileGlob"
   out         <- getEnv "out"
-  run (Args { csvFileGlob, out })
+  profile     <- (== "true") <$> getEnv "profile"
+  run (Args { csvFileGlob, out, profile })
 
-data Args = Args {csvFileGlob :: String, out :: String} deriving (Show)
+data Args = Args {csvFileGlob :: String, out :: String, profile :: Bool} deriving (Show)
 
 ghci :: IO ()
 ghci = void $ do
-  -- run (Args { csvFileGlob = "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/*.csv", out = "out.jsonl" })
-  run (Args { csvFileGlob = "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/e982a0fadaffe985944b3968e19f4ee997e89389.dbda9823d00ee7aa42c5cf99252b58b09c3bccfe.csv", out = "out.jsonl" })
-  -- run (Args { csvFileGlob = "/Users/chrismwendt/github.com/sourcegraph/lsif-cpp/examples/cross-app/output/*.csv", out = "out.jsonl" })
+  -- run (Args { csvFileGlob = "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/*.csv", out = "out.jsonl", profile = False })
+  run (Args { csvFileGlob = "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/e982a0fadaffe985944b3968e19f4ee997e89389.dbda9823d00ee7aa42c5cf99252b58b09c3bccfe.csv", out = "out.jsonl", profile = False })
+  -- run (Args { csvFileGlob = "/Users/chrismwendt/github.com/sourcegraph/lsif-cpp/examples/cross-app/output/*.csv", out = "out.jsonl", profile = False })
 
 run :: Args -> IO ()
-run (Args { csvFileGlob, out }) = do
+run (Args { csvFileGlob, out, profile }) = do
   when (csvFileGlob == "") $ putStrLn "Must specify --csvFileGlob" >> exitFailure
   when (out == "") $ putStrLn "Must specify --out" >> exitFailure
+
+  let
+    maybeTimeIt = if profile then timeIt else (\_ -> id)
+    texecute_ conn q = maybeTimeIt (show q) $ execute_ conn q
 
   removeIfExists "scratch.db"
   withConnection "scratch.db" $ \conn -> do
@@ -81,15 +86,19 @@ run (Args { csvFileGlob, out }) = do
 
     files <- glob csvFileGlob
     when (files == []) $ putStrLn (csvFileGlob <> " did not match any files!") >> exitFailure
+    let
+      nFiles = length files
+    putStrLn $ "Converting " <> show nFiles <> " CSV file(s) into one " <> out <> " LSIF file..."
     forM
-      files
-      (\file -> do
+      (zip files [0 .. ])
+      (\(file, index) -> do
+        putStrLn $ "Loading file " <> show (index + 1) <> "/" <> show nFiles <> " " <> file <> "..."
         input  <- BS.readFile file
-        result <- timeIt ("parse " ++ file) $ return $! A.parseOnly fileP input
+        result <- maybeTimeIt ("parse " ++ file) $ return $! A.parseOnly fileP input
         case result of
           Left  err  -> putStrLn err
           Right rows -> do
-            timeIt ("insert " ++ file) $ withTransaction conn $ forM_ rows $ \r@(Row kind kvs) -> do
+            maybeTimeIt ("insert " ++ file) $ withTransaction conn $ forM_ rows $ \r@(Row kind kvs) -> do
               let name = if kind == "variable" && "scopequalname" `Map.member` kvs then "" else fromJust $ msum $ map (kvs !?) ["qualname", "name"]
                   def  = execute conn "INSERT INTO symbols (name, deffile, defrange) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (name, getFile (kvs ! "loc"), getRange (kvs ! "loc", kvs ! "locend"))
               case kind of
@@ -107,6 +116,7 @@ run (Args { csvFileGlob, out }) = do
       )
 
     -- apply decldefs to connect defs and refs
+    putStrLn "Connecting references..."
     texecute_ conn $ Query $ T.pack $ [r|
       UPDATE refs SET
         deffile  = (SELECT d.deffile  FROM decldef d WHERE d.reffile = refs.deffile AND d.refrange = refs.defrange),
@@ -116,19 +126,23 @@ run (Args { csvFileGlob, out }) = do
     texecute_ conn "DROP TABLE decldef"
 
     -- erase the names of local variables in the refs table
+    putStrLn "Computing local symbols..."
     texecute_ conn $ Query $ T.pack $ [r|
       UPDATE refs SET name = (SELECT name FROM symbols WHERE refs.deffile = symbols.deffile AND refs.defrange = symbols.defrange AND refs.deffile != '')
       WHERE EXISTS (SELECT * FROM symbols WHERE refs.deffile = symbols.deffile AND refs.defrange = symbols.defrange AND refs.deffile != '')
     |]
 
     -- forget the locations of defs in header files
+    putStrLn "Computing external symbols..."
     texecute_ conn $ Query $ T.pack $ [r|
       UPDATE refs SET deffile = '', defrange = ''
       WHERE NOT EXISTS (SELECT * FROM symbols WHERE refs.deffile = symbols.deffile AND refs.defrange = symbols.defrange)
     |]
 
-    timeIt "emit" $ emit conn out
+    putStrLn $ "Dumping to " <> out <> "..."
+    maybeTimeIt "emit" $ emit conn out
 
+    putStrLn $ "Done!"
     -- TL.putStrLn =<< TL.readFile out
 
 emit :: Connection -> String -> IO ()
@@ -152,23 +166,6 @@ emit conn out = void $ do
       emitJSON $ object [ "references" .= object [ reffile .= fromJust (decodeJSON refranges :: Maybe [Text]) ] ]
       return (name, deffile, defrange)
     )
-
-texecute_ :: Connection -> Query -> IO ()
-texecute_ conn q = timeIt (show q) $ execute_ conn q
-
-timeIt :: String -> IO a -> IO a
-timeIt label a = do
-  start <- getTime Monotonic
-  r     <- a
-  end   <- getTime Monotonic
-  fprint (timeSpecs % ": " % Formatting.string % "\n") start end label
-  return r
-
-showTable :: Connection -> String -> IO ()
-showTable conn table = do
-  putStrLn $ "--- " ++ table
-  results <- query_ conn (Query $ T.pack $ "SELECT * FROM " ++ table) :: IO [[SQLData]]
-  mapM_ print results
 
 type Parser a = A.Parser a
 
@@ -211,3 +208,17 @@ removeIfExists fileName =  removeFile fileName `Exception.catch` (\(_ :: IOError
 
 decodeJSON :: FromJSON a => Text -> Maybe a
 decodeJSON = Aeson.decode . toLazyByteString . T.encodeUtf8Builder
+
+timeIt :: String -> IO a -> IO a
+timeIt label a = do
+  start <- getTime Monotonic
+  r     <- a
+  end   <- getTime Monotonic
+  fprint (timeSpecs % ": " % Formatting.string % "\n") start end label
+  return r
+
+showTable :: Connection -> String -> IO ()
+showTable conn table = do
+  putStrLn $ "--- " ++ table
+  results <- query_ conn (Query $ T.pack $ "SELECT * FROM " ++ table) :: IO [[SQLData]]
+  mapM_ print results
