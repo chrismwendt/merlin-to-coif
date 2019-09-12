@@ -53,9 +53,9 @@ import Control.Concurrent (threadDelay)
 
 main :: IO ()
 main = do
-  csvFileGlob <- getEnv "csvFileGlob"
-  out         <- getEnv "out"
-  profile     <- (== "true") <$> getEnv "profile"
+  csvFileGlob <- (?: "") <$> lookupEnv "csvFileGlob"
+  out         <- (?: "") <$> lookupEnv "out"
+  profile     <- (== Just "true") <$> lookupEnv "profile"
   run (Args { csvFileGlob, out, profile })
 
 data Args = Args {csvFileGlob :: String, out :: String, profile :: Bool} deriving (Show)
