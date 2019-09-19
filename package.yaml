@@ -15,6 +15,7 @@ dependencies:
   - attoparsec
   - bytestring
   - aeson
+  - extra
 default-extensions:
   - OverloadedStrings
   - QuasiQuotes

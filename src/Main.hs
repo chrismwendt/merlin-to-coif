@@ -1,5 +1,8 @@
 module Main where
 
+import Data.List.Extra (stripSuffix)
+import qualified Data.List as List
+import GHC.Generics
 import           Text.RawString.QQ
 import           Control.Applicative
 import qualified Data.ByteString               as BS
@@ -53,94 +56,116 @@ import Control.Concurrent (threadDelay)
 
 main :: IO ()
 main = do
-  csvFileGlob <- (?: "") <$> lookupEnv "csvFileGlob"
-  out         <- (?: "") <$> lookupEnv "out"
-  profile     <- (== Just "true") <$> lookupEnv "profile"
-  run (Args { csvFileGlob, out, profile })
+  inFileGlob <- (?: "") <$> lookupEnv "inFileGlob"
+  root       <- (?: "") <$> lookupEnv "root"
+  out        <- (?: "") <$> lookupEnv "out"
+  run (Args { inFileGlob, root, out })
 
-data Args = Args {csvFileGlob :: String, out :: String, profile :: Bool} deriving (Show)
+data Args = Args {inFileGlob :: String, root :: String, out :: String} deriving (Show)
 
 ghci :: IO ()
 ghci = void $ do
-  -- run (Args { csvFileGlob = "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/*.csv", out = "out.jsonl", profile = False })
-  run (Args { csvFileGlob = "/Users/chrismwendt/github.com/tree-sitter/tree-sitter/output/e982a0fadaffe985944b3968e19f4ee997e89389.dbda9823d00ee7aa42c5cf99252b58b09c3bccfe.csv", out = "out.jsonl", profile = False })
-  -- run (Args { csvFileGlob = "/Users/chrismwendt/github.com/sourcegraph/lsif-cpp/examples/cross-app/output/*.csv", out = "out.jsonl", profile = False })
+  run (Args {
+    -- inFileGlob = "/Users/chrismwendt/patdiff-build/duniverse/patdiff/lib/patdiff_format.ml.lsif.in",
+    -- inFileGlob = "/Users/chrismwendt/github.com/sourcegraph/merlin-to-lsif-converter/examples/two/comparison_result.ml.lsif.in",
+    inFileGlob = "/Users/chrismwendt/patdiff-build/duniverse/**/*.ml.lsif.in",
+    -- inFileGlob = "/Users/chrismwendt/patdiff-build/duniverse/a.ml.lsif.in",
+    root = "/Users/chrismwendt/patdiff-build/duniverse",
+    out = "out.jsonl"
+  })
 
 run :: Args -> IO ()
-run (Args { csvFileGlob, out, profile }) = do
-  when (csvFileGlob == "") $ putStrLn "Must specify --csvFileGlob" >> exitFailure
-  when (out == "") $ putStrLn "Must specify --out" >> exitFailure
-
-  let
-    maybeTimeIt = if profile then timeIt else (\_ -> id)
-    texecute_ conn q = maybeTimeIt (show q) $ execute_ conn q
+run (Args { inFileGlob, root, out }) = do
+  when (inFileGlob == "") $ putStrLn "Must specify environment variable inFileGlob" >> exitFailure
+  when (root == "") $ putStrLn "Must specify environment variable root" >> exitFailure
+  when (out == "") $ putStrLn "Must specify environment variable out" >> exitFailure
 
   removeIfExists "scratch.db"
   withConnection "scratch.db" $ \conn -> do
     execute_ conn "PRAGMA foreign_keys = ON"
+    execute_ conn "PRAGMA synchronous = OFF"
+    withTransaction conn $ do
+      execute_ conn [r|
+        CREATE TABLE refs (
+          file TEXT NOT NULL,
+          startline INTEGER NOT NULL,
+          startcol INTEGER NOT NULL,
+          endcol INTEGER NOT NULL,
+          deffile TEXT NOT NULL,
+          defline INTEGER NOT NULL,
+          defcol INTEGER NOT NULL,
+          hover TEXT,
+          UNIQUE (file, startline, startcol, endcol),
+          CHECK (file != ''),
+          CHECK (((deffile = '') AND (defline = -1) AND (defcol = -1)) OR ((deffile != '') AND (defline != -1) AND (defcol != -1)))
+        )
+      |]
+      execute_ conn "CREATE INDEX refs_ix on refs(deffile, defline, defcol)"
+      execute_ conn "CREATE INDEX refs_ix2 on refs(deffile, defline)"
 
-    execute_ conn "CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT NOT NULL, deffile TEXT NOT NULL, defrange TEXT NOT NULL, UNIQUE (name, deffile, defrange), CHECK (name != '' OR (deffile != '' AND defrange != '')), CHECK ((deffile = '') = (defrange = '')))"
-    execute_ conn "CREATE INDEX symbols_deffile_defrange on symbols(deffile, defrange)"
-    execute_ conn "CREATE TABLE refs (name TEXT NOT NULL, deffile TEXT NOT NULL, defrange TEXT NOT NULL, reffile TEXT NOT NULL, refrange TEXT NOT NULL, UNIQUE (reffile, refrange))"
-    execute_ conn "CREATE TABLE decldef (reffile TEXT NOT NULL, refrange TEXT NOT NULL, deffile TEXT NOT NULL, defrange TEXT NOT NULL, UNIQUE (reffile, refrange))"
+      files <- glob inFileGlob
+      when (files == []) $ putStrLn (inFileGlob <> " did not match any files!") >> exitFailure
+      let
+        nFiles = length files
+      putStrLn $ "Converting " <> show (length files) <> " *.lsif.in file(s) into one " <> out <> " CoIF file..."
+      forM
+        (zip files [0 .. ])
+        (\(globFile, index) -> do
+          let
+            file = case (root ++ "/") `List.stripPrefix` globFile of
+              Nothing -> error $ "File " ++ globFile ++ " is not under root " ++ root
+              Just v -> v
+          putStrLn $ "Loading file " <> show (index + 1) <> "/" <> show nFiles <> " " <> file <> "..."
+          input <- filter (not . ("{\"class" `BSL.isPrefixOf`)) . BSLC.lines <$> BSLC.readFile globFile
+          case zipWithM ((\ix line -> mapLeft (ix, line, ) (Aeson.eitherDecode line :: Either String Line))) [0 .. ] input of
+            Left (ix, line, e) -> do
+              putStrLn $ "On base-0 line " ++ (show ix) ++ ": " ++ e
+              putStrLn $ "| "
+              putStrLn $ "| " ++ (BSLC.unpack line)
+              putStrLn $ "| "
+            Right parsedLines -> do
+              let
+                sameLine (Line { start = Position { line = startline }, end = Position { line = endline } }) = startline == endline
+                toRef (Line { start = Position { line = startline, col = startcol }, end = Position { line = endline, col = endcol }, definition = Definition { dfile = deffile, pos = Position { line = defline, col = defcol } }, lhover = hover }) =
+                  case (if deffile == "" then Just "" else T.pack (root ++ "/") `T.stripPrefix` (if deffile == "*buffer*" then T.pack (".lsif.in" `stripSuffix` globFile ?: globFile) else deffile)) of
+                    Nothing -> Nothing
+                    Just thedeffile -> Just $ Ref { file = T.pack (".lsif.in" `stripSuffix` file ?: file), startline = startline - 1, startcol, endcol, deffile = thedeffile, defline = if defline == -1 then -1 else defline - 1, defcol, hover = T.take 100 <$> hover }
+                singleLineRefs = catMaybes $ map toRef $ filter sameLine $ parsedLines
+              void $ executeMany
+                conn
+                [r|
 
-    files <- glob csvFileGlob
-    when (files == []) $ putStrLn (csvFileGlob <> " did not match any files!") >> exitFailure
-    let
-      nFiles = length files
-    putStrLn $ "Converting " <> show nFiles <> " CSV file(s) into one " <> out <> " LSIF file..."
-    forM
-      (zip files [0 .. ])
-      (\(file, index) -> do
-        putStrLn $ "Loading file " <> show (index + 1) <> "/" <> show nFiles <> " " <> file <> "..."
-        input  <- BS.readFile file
-        result <- maybeTimeIt ("parse " ++ file) $ return $! A.parseOnly fileP input
-        case result of
-          Left  err  -> putStrLn err
-          Right rows -> do
-            maybeTimeIt ("insert " ++ file) $ withTransaction conn $ forM_ rows $ \r@(Row kind kvs) -> do
-              let name = if kind == "variable" && "scopequalname" `Map.member` kvs then "" else fromJust $ msum $ map (kvs !?) ["qualname", "name"]
-                  def  = execute conn "INSERT INTO symbols (name, deffile, defrange) VALUES (?, ?, ?) ON CONFLICT DO NOTHING" (name, getFile (kvs ! "loc"), getRange (kvs ! "loc", kvs ! "locend"))
-              case kind of
-                "type"     -> def
-                "typedef"  -> def
-                "function" -> def
-                "macro"    -> def
-                "variable" -> def
-                "decldef"  -> when ("defloc" `Map.member` kvs) $ execute conn "INSERT INTO decldef (reffile, refrange, deffile, defrange) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING" (getFile (kvs ! "loc"), getRange (kvs ! "loc", kvs ! "locend"), getFile (kvs ! "defloc"), getRange (kvs ! "defloc", kvs ! "deflocend"))
-                "ref"      -> execute conn "INSERT INTO refs (name, deffile, defrange, reffile, refrange) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING" (name, (getFile <$> (kvs !? "defloc")) ?: "", (getRange <$> ((,) <$> (kvs !? "defloc") <*> (kvs !? "deflocend"))) ?: "", getFile (kvs ! "loc"), getRange (kvs ! "loc", kvs ! "locend"))
-                "include"  -> return ()
-                "warning"  -> return ()
-                "call"     -> return ()
-                _          -> putStrLn $ "UNIMPLEMENTED " ++ show r
-      )
+                  INSERT INTO refs (file, startline, startcol, endcol, deffile, defline, defcol, hover)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(file, startline, startcol, endcol) DO UPDATE SET
+                          deffile = case when excluded.deffile != '' then excluded.deffile else deffile end,
+                          defline = case when excluded.defline != -1 then excluded.defline else defline end,
+                          defcol = case when excluded.defcol != -1 then excluded.defcol else defcol end,
+                          hover = COALESCE(excluded.hover, hover)
+                |]
+                singleLineRefs
+        )
 
-    -- apply decldefs to connect defs and refs
-    putStrLn "Connecting references..."
-    texecute_ conn $ Query $ T.pack $ [r|
-      UPDATE refs SET
-        deffile  = (SELECT d.deffile  FROM decldef d WHERE d.reffile = refs.deffile AND d.refrange = refs.defrange),
-        defrange = (SELECT d.defrange FROM decldef d WHERE d.reffile = refs.deffile AND d.refrange = refs.defrange)
-      WHERE (deffile, defrange) IN (SELECT reffile, refrange FROM decldef)
-    |]
-    texecute_ conn "DROP TABLE decldef"
+    putStrLn $ "Dropping rows without definitions..."
+    execute_ conn "DELETE FROM refs WHERE deffile = ''"
 
-    -- erase the names of local variables in the refs table
-    putStrLn "Computing local symbols..."
-    texecute_ conn $ Query $ T.pack $ [r|
-      UPDATE refs SET name = (SELECT name FROM symbols WHERE refs.deffile = symbols.deffile AND refs.defrange = symbols.defrange AND refs.deffile != '')
-      WHERE EXISTS (SELECT * FROM symbols WHERE refs.deffile = symbols.deffile AND refs.defrange = symbols.defrange AND refs.deffile != '')
-    |]
-
-    -- forget the locations of defs in header files
-    putStrLn "Computing external symbols..."
-    texecute_ conn $ Query $ T.pack $ [r|
-      UPDATE refs SET deffile = '', defrange = ''
-      WHERE NOT EXISTS (SELECT * FROM symbols WHERE refs.deffile = symbols.deffile AND refs.defrange = symbols.defrange)
-    |]
+    -- putStrLn $ "Dropping outer ranges that are overridden by inner ranges..."
+    -- execute_ conn [r|
+    --   DELETE FROM refs
+    --   WHERE EXISTS (
+    --     SELECT * FROM refs r2
+    --     WHERE
+    --       refs.file = r2.file AND
+    --       refs.startline = r2.startline AND
+    --       (
+    --         (refs.startcol < r2.startcol AND r2.endcol <= refs.endcol) OR
+    --         (refs.startcol <= r2.startcol AND r2.endcol < refs.endcol)
+    --       )
+    --   )
+    -- |]
 
     putStrLn $ "Dumping to " <> out <> "..."
-    maybeTimeIt "emit" $ emit conn out
+    emit conn out
 
     putStrLn $ "Done!"
     -- TL.putStrLn =<< TL.readFile out
@@ -152,53 +177,43 @@ emit conn out = void $ do
 
   fold_
     conn
-    "SELECT name, deffile, defrange, reffile, json_group_array(refrange) FROM refs GROUP BY name, deffile, defrange, reffile"
-    ("", "", "")
-    (\old@(oldname, olddeffile, olddefrange) ((name, deffile, defrange, reffile, refranges) :: (Text, Text, Text, Text, Text)) -> do
+    "select deffile, defline, defcol, file, hover, json_group_array(startline), json_group_array(startcol), json_group_array(endcol) from refs group by deffile, defline, defcol, file"
+    ("", -1, -1)
+    (\old@(olddeffile, olddefline, olddefcol) ((deffile, defline, defcol, reffile, hover, refstartlines, refstartcols, refendcols) :: (Text, Int, Int, Text, Maybe Text, Text, Text, Text)) -> do
       let
         emitJSON = TL.appendFile out . (`TL.snoc` '\n') . Aeson.encodeToLazyText
-      when (old /= (name, deffile, defrange)) $ do
-        case (name, deffile) of
-          ("", "") -> putStrLn "bug in lsif-cpp: either name or deffile are expected to be populated"
-          (_, "") -> emitJSON $ object [ "symbol" .= object [ "name" .= name ] ]
-          ("", _) -> emitJSON $ object [ "symbol" .= object [ "file" .= deffile, "range" .= defrange ] ]
-          (_, _) -> emitJSON $ object [ "symbol" .= object [ "name" .= name, "file" .= deffile, "range" .= defrange ] ]
-      emitJSON $ object [ "references" .= object [ reffile .= fromJust (decodeJSON refranges :: Maybe [Text]) ] ]
-      return (name, deffile, defrange)
+      when (old /= (deffile, defline, defcol)) $ emitJSON $ object [ "symbol" .= object [ "file" .= deffile, "range" .= (T.pack (show defline) <> ":" <> T.pack (show defcol) <> "-" <> T.pack (show (defcol + 1))), "hover" .= hover ] ]
+      let
+        ints y = case (decodeJSON y) :: Maybe [Int] of
+          Nothing -> error $ "could not decode as [Int] " ++ show y
+          Just v -> v
+      emitJSON $ object [ "references" .= object [ "file" .= reffile, "ranges" .= zipWith3 (\startline startcol endcol -> T.pack (show startline) <> ":" <> T.pack (show startcol) <> "-" <> T.pack (show endcol)) (ints refstartlines) (ints refstartcols) (ints refendcols) ] ]
+      return (deffile, defline, defcol)
     )
 
-type Parser a = A.Parser a
+data Position = Position { line :: Int, col :: Int } deriving (Eq, Ord, Show, Generic)
+data Definition = Definition { dfile :: Text, pos :: Position } deriving (Eq, Ord, Show, Generic)
+data Line = Line { start :: Position, end :: Position, definition :: Definition, lhover :: Maybe Text } deriving (Eq, Ord, Show, Generic)
+data Ref = Ref { file :: Text, startline :: Int, startcol :: Int, endcol :: Int, deffile :: Text, defline :: Int, defcol :: Int, hover :: Maybe Text } deriving (Eq, Ord, Show)
 
-data Row = Row Text (Map Text Text) deriving (Eq, Ord)
+instance ToRow Ref where
+  toRow (Ref { file, startline, startcol, endcol, deffile, defline, defcol, hover }) = toRow (file, startline, startcol, endcol, deffile, defline, defcol, hover)
 
-instance Show Row where
-  show (Row kind kvs) = "(" ++ T.unpack kind ++ ") " ++ unwords (map (\(k, v) -> T.unpack k ++ ":" ++ T.unpack v) (Map.toList kvs))
+instance FromJSON Position
 
-fileP :: Parser [Row]
-fileP = rowP `M.sepEndBy` "\n"
+instance FromJSON Definition where
+  parseJSON = Aeson.withObject "Definition" $ \v -> do
+    dfile <- v Aeson..: "file"
+    pos <- v Aeson..: "pos"
+    return $ Definition { dfile, pos }
 
-rowP :: Parser Row
-rowP = do
-  let keyP :: Parser Text
-      keyP = T.decodeLatin1 <$> A.takeWhile (\c -> ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || c == '_')
-      quotedP :: Parser Text
-      quotedP = T.decodeLatin1 . BSC.pack <$> (A.char '"' *> A.many' (('"' <$ "\"\"") <|> (A.char '\\' *> A.anyChar) <|> A.notChar '"') <* A.char '"')
-      kvP :: Parser (Text, Text)
-      kvP = (,) <$> keyP <* A.char ',' <*> quotedP
-  kind <- keyP
-  A.char ','
-  keyvals <- kvP `M.sepBy` A.char ','
-  return $ Row kind (Map.fromList keyvals)
-
-getFile :: Text -> Text
-getFile s = case reverse $ T.splitOn ":" s of
-  (column : row : file) -> T.intercalate ":" file
-  _ -> ""
-
-getRange :: (Text, Text) -> Text
-getRange (s1, s2) = case (reverse $ T.splitOn ":" s1, reverse $ T.splitOn ":" s2) of
-  (column1 : row1 : _, column2 : row2 : _) -> row1 <> ":" <> column1 <> "-" <> row2 <> ":" <> column2
-  _ -> ""
+instance FromJSON Line where
+  parseJSON = Aeson.withObject "Line" $ \v -> do
+    start <- v Aeson..: "start"
+    end <- v Aeson..: "end"
+    definition <- v Aeson..:? "definition" Aeson..!= (Definition { dfile = "", pos = Position { line = -1, col = -1 } })
+    lhover <- v Aeson..:? "type"
+    return $ Line { start, end, definition, lhover }
 
 removeIfExists :: FilePath -> IO ()
 removeIfExists fileName =  removeFile fileName `Exception.catch` (\(_ :: IOError) -> return ())
@@ -222,3 +237,7 @@ showTable conn table = do
   putStrLn $ "--- " ++ table
   results <- query_ conn (Query $ T.pack $ "SELECT * FROM " ++ table) :: IO [[SQLData]]
   mapM_ print results
+
+mapLeft :: (a -> c) -> Either a b -> Either c b
+mapLeft f (Left v) = Left (f v)
+mapLeft _ (Right v) = Right v
